@@ -1,4 +1,4 @@
-(defproject fi.lupapiste/lein-bom "0.3.0"
+(defproject fi.lupapiste/lein-bom "0.3.1"
   :description "A leiningen plugin that provides support for importing maven BOMs"
   :url "https://github.com/lupapiste/lein-bom"
   :license {:name "Eclipse Public License"

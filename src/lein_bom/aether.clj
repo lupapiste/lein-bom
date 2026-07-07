@@ -9,6 +9,7 @@
            (org.eclipse.aether.graph Dependency Exclusion)
            (org.eclipse.aether DefaultRepositorySystemSession)
            (org.eclipse.aether.artifact Artifact DefaultArtifact)
+           (org.eclipse.aether.transfer AbstractTransferListener TransferEvent)
            (org.eclipse.aether.util.repository SimpleArtifactDescriptorPolicy)
            (java.util.concurrent Executors Callable Future)))
 
@@ -137,6 +138,33 @@
   (locking print-lock
     (println s)))
 
+(defn- resource->bom-coords
+  "Turn an Aether resource path (…/com/google/cloud/libraries-bom/26.84.0/libraries-bom-26.84.0.pom)
+   into a \"group/artifact:version\" label. Returns nil for non-POM resources
+   (checksums, metadata) so only real BOM POMs get logged."
+  [^String name]
+  (when (.endsWith name ".pom")
+    (let [parts (str/split name #"/")
+          n     (count parts)]
+      (when (>= n 4)
+        (format "%s/%s:%s"
+                (str/join "." (subvec parts 0 (- n 3)))   ; groupId
+                (nth parts (- n 3))                        ; artifactId
+                (nth parts (- n 2)))))))                   ; version
+
+(defn- download-logging-transfer-listener
+  "A TransferListener that logs each BOM POM once, only when it is actually
+   fetched over the network. Cached POMs fire no transfer event, so they stay
+   silent -- mirroring how Leiningen reports a dependency download. Fires on the
+   connector's download threads, so it prints through the shared lock."
+  []
+  (proxy [AbstractTransferListener] []
+    (transferSucceeded [^TransferEvent event]
+      (let [res    (.getResource event)
+            coords (resource->bom-coords (.getResourceName res))]
+        (when coords
+          (prewarm-log (format "Downloaded BOM %s from %s" coords (.getRepositoryUrl res))))))))
+
 (defn prewarm-import-graph!
   "Breadth-first download of the POM import closure of `seed-artifacts` into the
    local repo, resolving each level's POMs concurrently across `threads` workers.
@@ -164,7 +192,6 @@
                                (reify Callable
                                  (call [_]
                                    (try
-                                     (prewarm-log (format "Resolving BOM %s/%s:%s" g a v))
                                      (let [art (DefaultArtifact. ^String g ^String a "" "pom" ^String v)
                                            res (.resolveArtifact system session
                                                                  (ArtifactRequest. art repositories nil))
@@ -188,13 +215,19 @@
         ^RepositorySystem system (repository-system)
         mirror-selector-fn (memoize (partial mirror-selector-fn mirrors))
         mirror-selector (mirror-selector mirror-selector-fn proxy)
-        ^RepositorySystemSession session ((or repository-session-fn
-                                              artifact-descriptors-repository-session)
-                                           {:repository-system system
-                                            :local-repo        local-repo
-                                            :offline?          offline?
-                                            :transfer-listener transfer-listener
-                                            :mirror-selector   mirror-selector})
+        ^RepositorySystemSession session (let [s ((or repository-session-fn
+                                                      artifact-descriptors-repository-session)
+                                                   {:repository-system system
+                                                    :local-repo        local-repo
+                                                    :offline?          offline?
+                                                    :transfer-listener transfer-listener
+                                                    :mirror-selector   mirror-selector})]
+                                           ;; log BOM POM downloads, unless the caller wired up its own listener
+                                           (when (and prewarm (nil? transfer-listener)
+                                                      (instance? DefaultRepositorySystemSession s))
+                                             (.setTransferListener ^DefaultRepositorySystemSession s
+                                                                   (download-logging-transfer-listener)))
+                                           s)
         deps (->> coordinates
                   (map #(if-let [local-file (get files %)]
                           (-> (artifact %)
